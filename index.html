@@ -295,8 +295,11 @@ const reception = holoBox(3, 1, 1, COL.line, 0.05, 0.45); reception.position.set
 // Wi-Fi access points on the ceiling
 const APS = [];
 [[-4.5, -1], [3.5, -1], [6.5, 5]].forEach(([x, z], i) => {
-  const ap = register('ap' + i, holoShape(new THREE.CylinderGeometry(0.45, 0.45, 0.12, 24), COL.manage, 0.25));
+  const ap = register('ap' + i, holoShape(new THREE.CylinderGeometry(0.7, 0.7, 0.16, 28), COL.manage, 0.35));
+  const g = glowDot(COL.manage, 2.4); g.material.opacity = 0.45; ap.add(g);
   ap.position.set(x, 3.05, z); scene.add(ap); APS.push(ap);
+  label('Wi-Fi access point', V(x, 3.75, z), 'small');
+  scene.add(line([V(10.6, 3.35, -7), V(10.6, 3.2, z), V(x, 3.2, z)], 0x284a7e, 0.45));
 });
 
 // desks, devices and people
@@ -434,6 +437,39 @@ function checked(a, b, isBad, opt) {
     ? { stopAt: 0.96, blockText: opt.blockText, speed: opt.speed }
     : { speed: opt.speed, onEnd: p => { scan(opt.node, p); opt.next && opt.next(p); } });
 }
+// office traffic follows the real network: laptop -> Wi-Fi access point -> switch -> firewall,
+// desktops, printer and server -> switch (cable) -> firewall. The remote worker goes straight out from home.
+const FWP = V(-11.6, 1.2, 0.5), SWP = V(10.6, 3.35, -7);
+function nearestAP(pos) { return APS.reduce((b, a) => a.position.distanceTo(pos) < b.position.distanceTo(pos) ? a : b); }
+function hopsToFirewall(d) {          // list of [point, node name] from the device out to the firewall
+  const h = [];
+  if (d.type === 'laptop') { const ap = nearestAP(d.pos); h.push([ap.position.clone(), ap.userData.name]); }
+  h.push([SWP.clone(), 'switch'], [FWP.clone(), 'firewall']);
+  return h;
+}
+function chain(start, hops, color, opt, done) {   // move a packet hop by hop, lighting each box it passes
+  if (!hops.length) { done && done(start); return; }
+  const [pt, node] = hops[0];
+  packet(arc(start, pt, start.distanceTo(pt) > 8 ? 1.4 : 0.5), color, { speed: Math.max(14, opt.speed || 0), size: opt.size, onEnd: () => { if (node) flash(node, COL.safe, 0.3); chain(pt, hops.slice(1), color, opt, done); } });
+}
+function outFrom(d, dest, h, color, opt = {}) {
+  if (d.remote) { packet(arc(d.pos, dest, h), color, opt); return; }
+  chain(d.pos, hopsToFirewall(d), color, opt, () => packet(arc(FWP, dest, h), color, opt));
+}
+function inTo(src, d, h, color, opt = {}) {
+  if (d.remote) { packet(arc(src, d.pos, h), color, opt); return; }
+  const back = hopsToFirewall(d).reverse().slice(1).concat([[d.pos.clone(), null]]);
+  packet(arc(src, FWP, h), color, { speed: opt.speed, size: opt.size, onEnd: () => { flash('firewall', COL.safe, 0.3); chain(FWP.clone(), back, color, opt, () => opt.onEnd && opt.onEnd(d.pos)); } });
+}
+let TUNNELS = [];
+function tunnel(a, b, h, color, text) {
+  const c = arc(a, b, h);
+  const tube = new THREE.Mesh(new THREE.TubeGeometry(c, 48, 0.18, 8, false), new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.3, depthWrite: false, blending: THREE.AdditiveBlending }));
+  scene.add(tube); TUNNELS.push(tube);
+  if (text) TUNNELS.push(label(text, c.getPointAt(0.5).add(V(0, 0.9, 0))));
+  return c;
+}
+function clearTunnels() { TUNNELS.forEach(o => { scene.remove(o); if (o.geometry) o.geometry.dispose(); if (o.material) o.material.dispose(); }); TUNNELS = []; }
 let HALOS = [];
 function addHalo(pos, color, size) { const h = glowDot(color, size); h.material.opacity = 0.35; h.position.copy(pos); scene.add(h); HALOS.push(h); }
 function clearHalos() { HALOS.forEach(h => { scene.remove(h); h.material.dispose(); }); HALOS = []; }
@@ -442,155 +478,203 @@ function clearHalos() { HALOS.forEach(h => { scene.remove(h); h.material.dispose
 let TIMERS = [];
 function every(ms, fn) { fn(); const id = setInterval(fn, ms); TIMERS.push(() => clearInterval(id)); }
 function later(fn, ms) { const id = setTimeout(fn, ms); TIMERS.push(() => clearTimeout(id)); }
-function stopAll() { clearHalos(); TIMERS.forEach(f => f()); TIMERS = []; DEVICES.forEach(d => untint(d.name)); ['server', 'firewall', 'bdr', 'm365', 'azure', 'printer', 'home'].forEach(untint); }
+function stopAll() { clearHalos(); clearTunnels(); TIMERS.forEach(f => f()); TIMERS = []; DEVICES.forEach(d => untint(d.name)); ['server', 'firewall', 'bdr', 'm365', 'azure', 'printer', 'home'].forEach(untint); }
 
 const pick = a => a[Math.floor(Math.random() * a.length)];
 const office6 = () => DEVICES.filter(d => !d.remote);
 const top = (v, y = 0.6) => v.clone().add(V(0, y, 0));
 
 // ---------------------------------------------------------------- services
+// the work-from-home link: always there, home to the office firewall
+const REMOTE_LINK = arc(homeDesk.pos, FWP, 5);
+(() => {
+  const g = register('remotelink', new THREE.Group());
+  g.add(new THREE.Mesh(new THREE.TubeGeometry(REMOTE_LINK, 60, 0.16, 8, false), new THREE.MeshBasicMaterial({ color: COL.safe, transparent: true, opacity: 0.22, depthWrite: false, blending: THREE.AdditiveBlending })));
+  scene.add(g);
+  label('Secure remote access (work from home)', REMOTE_LINK.getPointAt(0.5).add(V(0, 1, 0)), 'small');
+})();
+function remoteSession(onDone) {   // home -> firewall -> switch -> office server, and the screen back home
+  packet(REMOTE_LINK, COL.safe, { speed: 13, size: 0.7, onEnd: () => { flash('firewall', COL.safe, 0.3);
+    chain(FWP.clone(), [[SWP.clone(), 'switch'], [V(10.6, 2.2, -7), 'server']], COL.safe, { speed: 14, size: 0.7 }, p => { onDone && onDone(p);
+      chain(p, [[SWP.clone(), 'switch'], [FWP.clone(), 'firewall']], COL.cloud, { speed: 14, size: 0.6 }, () => packet(arc(FWP, homeDesk.pos, 5), COL.cloud, { speed: 13, size: 0.6, onEnd: () => flash(homeDesk.name, COL.ok, 0.4) })); }); } });
+}
+
 const S = [
- { id: 'firewall', g: 'protect', name: 'Managed firewall', short: 'Guards the office internet line', objs: ['firewall', 'internet', 'switch'],
+ { id: 'firewall', g: 'protect', name: 'Managed firewall', short: 'Guards the office internet line', objs: ['firewall', 'internet', 'switch', 'server', 'home', 'remotelink', 'ap0', 'ap1', 'ap2'],
    what: 'A firewall on the office internet line, installed, monitored and updated by our team.',
    gets: 'Traffic is inspected on the way in. Attacks and known bad sources are blocked before they reach a computer. Firmware and security licenses stay current.',
    solves: 'Attackers scanning and breaking into the office network.',
-   flow: ['Traffic arrives from the internet, good and bad mixed together.', 'The firewall inspects it. Attacks stop right there.', 'Clean traffic turns blue and reaches the computers safely.'],
-   pitch: 'Most break-ins start at the internet line. We own the box, the updates and the alerts.',
+   flow: ['Traffic arrives from the internet, good and bad mixed together.', 'The firewall inspects it. Attacks stop right there.', 'Clean traffic (blue) goes through the switch and Wi-Fi to the computers.', 'Remote staff connect securely from home (VPN or remote desktop) and work on the office server.'],
+   pitch: 'Most break-ins start at the internet line. We own the box, the updates and the alerts, and remote staff get in safely.',
    cam: { pos: V(-24, 12, 16), target: V(-16, 2, 0) },
-   run() { every(700, () => { const bad = Math.random() < 0.4; const dev = pick(office6());
-     checked(P.internet, V(-11.6, 1.2, 0.5), bad, { node: 'firewall', blockText: 'Attack blocked', next: p => packet(arc(p, dev.pos, 2.2), COL.safe, { speed: 7, onEnd: () => hit(dev, Math.random() < 0.3 ? 'Safe' : null) }) }); }); } },
- { id: 'email', g: 'protect', name: 'MXINSPECT email security', short: 'Checks every email before the inbox', objs: ['mailfilter', 'm365', 'internet'],
+   run() {
+     const vpn = REMOTE_LINK;
+     every(750, () => { const bad = Math.random() < 0.4; const dev = pick(office6());
+       const back = hopsToFirewall(dev).reverse().slice(1).concat([[dev.pos.clone(), null]]);
+       checked(P.internet, FWP, bad, { node: 'firewall', blockText: 'Attack blocked', next: p => chain(p, back, COL.safe, { speed: 14 }, () => hit(dev, Math.random() < 0.3 ? 'Safe' : null)) }); });
+     every(2600, () => remoteSession(p => { tag(top(p, 1.6), 'Working on the office server from home'); flash('server', COL.ok, 0.6); }));
+   } },
+ { id: 'email', g: 'protect', name: 'MXINSPECT email security', short: 'Checks every email before the inbox', objs: ['mailfilter', 'm365', 'internet', 'firewall'],
    what: 'Every email is checked in the cloud before it reaches anyone’s inbox.',
    gets: 'Spam, phishing, fake invoices and infected attachments are quarantined. Staff get a daily digest of what was held.',
    solves: 'Phishing and ransomware arriving by email.',
-   flow: ['Emails arrive, some of them phishing (red).', 'MXINSPECT checks every one. Phishing and viruses are held in quarantine.', 'Clean emails turn blue and land in the inbox. The person only sees safe mail.'],
+   flow: ['Emails arrive from the internet, some of them phishing (red).', 'MXINSPECT checks every one in the cloud. Phishing and viruses are held in quarantine.', 'Clean emails turn blue and reach every inbox, in the office or at home.'],
    pitch: 'Most attacks start with an email. This stops them before anyone has to make a choice.',
    cam: { pos: V(-6, 18, 14), target: V(-8, 8, -6) },
    run() { every(850, () => { const bad = Math.random() < 0.45; const dev = pick(DEVICES);
-     checked(P.internet, P.mailfilter, bad, { h1: 4, node: 'mailfilter', blockText: 'Phishing blocked', next: p => packet(arc(p, P.m365, 3), COL.safe, { onEnd: q => packet(arc(q, dev.pos, 1), COL.safe, { speed: 12, onEnd: () => hit(dev, 'Clean email') }) }) }); }); } },
- { id: 'secureroute', g: 'protect', name: 'Secure Route', short: 'Blocks dangerous websites, anywhere', objs: ['webfilter', 'home', 'internet'],
+     checked(P.internet, P.mailfilter, bad, { h1: 4, node: 'mailfilter', blockText: 'Phishing blocked', next: p => packet(arc(p, P.m365, 3), COL.safe, { onEnd: q => inTo(q, dev, 3, COL.safe, { speed: 12, onEnd: () => hit(dev, 'Clean email') }) }) }); }); } },
+ { id: 'secureroute', g: 'protect', name: 'Secure Route', short: 'Blocks dangerous websites, anywhere', objs: ['webfilter', 'home', 'internet', 'firewall'],
    what: 'Blocks dangerous websites for every computer, in the office or at home.',
    gets: 'A click on a bad link goes nowhere. Infected computers can’t reach the attacker’s servers. Works on laptops away from the office.',
    solves: 'Malicious links, fake login pages and malware calling home.',
-   flow: ['Someone clicks a link, in the office or at home.', 'Secure Route checks the website first. Dangerous ones are blocked.', 'Safe websites turn blue and open normally.'],
+   flow: ['Someone clicks a link, in the office (through the firewall) or at home.', 'Secure Route checks the website first. Dangerous ones are blocked.', 'Safe websites turn blue and open normally.'],
    pitch: 'One wrong click is all it takes. Secure Route makes that click harmless, even on home Wi-Fi.',
    cam: { pos: V(-10, 12, 30), target: V(-10, 4, 8) },
    run() { every(950, () => { const dev = pick(DEVICES); const bad = Math.random() < 0.4;
-     packet(arc(dev.pos, P.webfilter, 3), COL.unchecked, { speed: 10, onEnd: p => { if (bad) { burst(p, COL.threat); tag(top(p, 1.3), 'Bad site blocked', '#ff4d6d'); hit(dev, null, COL.ok); }
-       else { scan('webfilter', p); packet(arc(p, P.internet, 3), COL.safe, { speed: 10, onEnd: q => packet(arc(q, dev.pos, 3), COL.safe, { speed: 12, onEnd: () => hit(dev, 'Safe site') }) }); } } }); }); } },
+     outFrom(dev, P.webfilter, 3, COL.unchecked, { speed: 10, onEnd: () => { const p = P.webfilter;
+       if (bad) { burst(p, COL.threat); tag(top(p, 1.3), 'Bad site blocked', '#ff4d6d'); hit(dev, null, COL.ok); }
+       else { scan('webfilter', p); packet(arc(p, P.internet, 3), COL.safe, { speed: 10, onEnd: q => inTo(q, dev, 3, COL.safe, { speed: 12, onEnd: () => hit(dev, 'Safe site') }) }); } } }); }); } },
  { id: 'soc', g: 'protect', name: 'SOC, 24/7 threat monitoring', short: 'People and tools watching day and night', objs: ['soc', 'radar', 'firewall', 'server', 'm365'],
    what: 'Our security operations center watches logs from firewalls, servers, computers and Microsoft 365, day and night.',
    gets: 'Suspicious sign-ins and attacker behavior are caught early. A computer acting like ransomware can be isolated automatically.',
    solves: 'Attackers who already got in and are moving quietly.',
-   flow: ['Every device and Microsoft 365 sends its activity to our SOC (blue).', 'Something odd turns up on a computer (red).', 'The SOC isolates it, cleans it up and brings it back online (green).'],
+   flow: ['Every computer (office and home), the firewall, the server and Microsoft 365 send their activity to our SOC (blue).', 'Something odd turns up on a computer (red).', 'The SOC isolates it, cleans it up and brings it back online (green).'],
    pitch: 'Prevention fails eventually. The SOC is the alarm system that notices someone inside.',
    cam: { pos: V(22, 20, 30), target: V(14, 3, 0) },
    run() {
      every(2400, () => { ring(V(0, 0.2, 0), COL.manage, { r0: 1, r1: 22, dur: 2.2 }); });
-     every(320, () => { const src = pick([...DEVICES.map(d => d.pos), V(-11.6, 1.1, 0.5), V(10.6, 3, -7), P.m365]); packet(arc(src, V(P.soc.x - 1, 4, P.soc.z), 6), COL.safe, { size: 0.6, speed: 16 }); });
-     every(5600, () => { const d = pick(office6()); flash(d.name, COL.threat, 2.6); tag(top(d.pos, 1.4), 'Suspicious activity', '#ff4d6d');
-       packet(arc(d.pos, V(P.soc.x - 1, 4, P.soc.z), 6), COL.threat, { speed: 18 });
-       later(() => packet(arc(V(P.soc.x - 1, 4, P.soc.z), d.pos, 7), COL.protect, { speed: 16, onEnd: p => { ring(p, COL.protect, { r0: 0.5, r1: 2.6, dur: 1.2 }); tag(top(p, 1.6), 'Isolated', '#ffb547');
-         later(() => hit(d, 'Clean, back online'), 1600); } }), 1100); });
+     every(380, () => { const r = Math.random();
+       if (r < 0.6) outFrom(pick(DEVICES), SOCP(), 6, COL.safe, { size: 0.6, speed: 16 });
+       else if (r < 0.8) packet(arc(FWP, SOCP(), 6), COL.safe, { size: 0.6, speed: 16 });
+       else if (r < 0.9) outFrom({ pos: V(10.6, 3, -7) }, SOCP(), 6, COL.safe, { size: 0.6, speed: 16 });
+       else packet(arc(P.m365, SOCP(), 6), COL.safe, { size: 0.6, speed: 16 }); });
+     every(5600, () => { const d = pick(DEVICES); flash(d.name, COL.threat, 2.6); tag(top(d.pos, 1.4), 'Suspicious activity', '#ff4d6d');
+       outFrom(d, SOCP(), 6, COL.threat, { speed: 18 });
+       later(() => inTo(SOCP(), d, 7, COL.protect, { speed: 16, onEnd: () => { ring(d.pos, COL.protect, { r0: 0.5, r1: 2.6, dur: 1.2 }); tag(top(d.pos, 1.6), 'Isolated', '#ffb547');
+         later(() => hit(d, 'Clean, back online'), 1600); } }), 1300); });
    } },
- { id: 'sat', g: 'protect', name: 'Security awareness training', short: 'Teaches staff to spot scams', objs: ['mailfilter'],
+ { id: 'sat', g: 'protect', name: 'Security awareness training', short: 'Teaches staff to spot scams', objs: ['mailfilter', 'm365'],
    what: 'Short trainings and fake phishing tests that teach staff what a scam looks like.',
    gets: 'Monthly lessons, test campaigns and a report of who clicked and who reported.',
    solves: 'The person being the weak spot.',
-   flow: ['We send a harmless fake phishing email (amber).', 'Trained staff spot it and report it (green).', 'Anyone who clicks gets a short lesson right away.'],
+   flow: ['We send a harmless fake phishing email to staff, in the office or at home (amber).', 'Trained staff spot it and report it (green).', 'Anyone who clicks gets a short lesson right away.'],
    pitch: 'Filters catch most scams. Training covers the one that gets through.',
    cam: { pos: V(10, 14, 16), target: V(-1, 1.5, 0) },
-   run() { every(2200, () => { const d = pick(DEVICES); packet(arc(P.mailfilter, d.pos, 3), COL.protect, { speed: 11, onEnd: () => { const ok = Math.random() < 0.8; hit(d, ok ? 'Reported the test' : 'Clicked: lesson sent', ok ? COL.ok : COL.protect); } }); }); } },
- { id: 'darkweb', g: 'protect', name: 'Dark web monitoring', short: 'Finds leaked company passwords', objs: ['darkweb', 'soc'],
+   run() { every(2200, () => { const d = pick(DEVICES); packet(arc(P.mailfilter, P.m365, 3), COL.protect, { speed: 12, onEnd: q => inTo(q, d, 3, COL.protect, { speed: 12, onEnd: () => { const ok = Math.random() < 0.8; hit(d, ok ? 'Reported the test' : 'Clicked: lesson sent', ok ? COL.ok : COL.protect); } }) }); }); } },
+ { id: 'darkweb', g: 'protect', name: 'Dark web monitoring', short: 'Finds leaked company passwords', objs: ['darkweb', 'soc', 'm365'],
    what: 'We watch dark web markets for your company’s leaked usernames and passwords.',
    gets: 'An alert when a work account shows up in a breach, and a password reset before it’s used.',
    solves: 'Stolen passwords from other websites being used to get in.',
-   flow: ['A work password shows up on the dark web (red).', 'Our team gets the alert.', 'The password is reset before anyone can use it (green).'],
+   flow: ['A work password shows up on the dark web (red).', 'Our team gets the alert and resets the password in Microsoft 365.', 'The person signs in with a new password (green).'],
    pitch: 'If your staff reuse passwords, a breach somewhere else is a breach here. We find out first.',
    cam: { pos: V(-14, 14, 36), target: V(-16, 2, 10) },
-   run() { every(3400, () => { tag(top(P.darkweb, 1.8), 'Leaked password found', '#ff4d6d');
-     packet(arc(P.darkweb, V(P.soc.x, 4, P.soc.z), 14), COL.threat, { speed: 22, onEnd: () => { const d = pick(DEVICES); packet(arc(V(P.soc.x - 1, 4, P.soc.z), d.pos, 7), COL.safe, { speed: 18, onEnd: () => hit(d, 'Password reset') }); } }); }); } },
+   run() { every(3600, () => { tag(top(P.darkweb, 1.8), 'Leaked password found', '#ff4d6d');
+     packet(arc(P.darkweb, SOCP(), 14), COL.threat, { speed: 22, onEnd: () => { const d = pick(DEVICES);
+       packet(arc(SOCP(), P.m365, 6), COL.safe, { speed: 18, onEnd: q => { tag(top(q, 2.6), 'Password reset', '#3df5a8'); inTo(q, d, 3, COL.safe, { speed: 14, onEnd: () => hit(d, 'New password') }); } }); } }); }); } },
  { id: 'cloudbackup', g: 'backup', name: 'eCare Cloud Backup', short: 'Backs up email, files and Teams', objs: ['m365', 'vault'],
    what: 'Backups of every mailbox, OneDrive, SharePoint site and Teams chat, kept outside Microsoft.',
    gets: 'Restore a deleted email, a folder or a whole mailbox, years back. Departed staff’s data stays.',
    solves: 'Deleted or overwritten files, ransomware in Microsoft 365, accounts removed too early.',
-   flow: ['Email, files and Teams chats are copied out of Microsoft 365 (blue).', 'They’re stored in a separate backup vault.', 'Anything deleted or damaged can be restored (green).'],
+   flow: ['Staff work in email, OneDrive and Teams, all stored in Microsoft 365 (blue).', 'Every day it’s copied out to a separate backup vault.', 'Anything deleted or damaged can be restored (green).'],
    pitch: 'Microsoft keeps the service running. Keeping your data recoverable is your job, and this does it.',
    cam: { pos: V(16, 22, 6), target: V(9, 12, -11) },
-   run() { every(450, () => packet(arc(P.m365, P.vault, 3), COL.safe, { speed: 12 })); every(3000, () => { ring(P.vault, COL.ok, { r0: 1, r1: 3.5 }); flash('vault', COL.ok, 0.8); tag(top(P.vault, 2.6), 'Protected'); }); } },
- { id: 'bdr', g: 'backup', name: 'Business continuity (BDR)', short: 'Keeps servers running after a disaster', objs: ['server', 'bdr', 'vault'],
+   run() { every(900, () => outFrom(pick(DEVICES), P.m365, 3, COL.safe, { speed: 13, size: 0.7 }));
+     every(450, () => packet(arc(P.m365, P.vault, 3), COL.safe, { speed: 12 }));
+     every(3000, () => { ring(P.vault, COL.ok, { r0: 1, r1: 3.5 }); flash('vault', COL.ok, 0.8); tag(top(P.vault, 2.6), 'Protected'); }); } },
+ { id: 'bdr', g: 'backup', name: 'Business continuity (BDR)', short: 'Keeps servers running after a disaster', objs: ['server', 'bdr', 'vault', 'firewall'],
    what: 'A backup box in the office copies servers and key computers every few hours, and sends a copy to the cloud.',
    gets: 'Fast restores from the box. If the server dies, it starts as a virtual server in the cloud and work continues.',
    solves: 'Server failure, fire, flood and ransomware.',
-   flow: ['Every few hours the server is copied to the backup box (blue).', 'The box sends a copy offsite to the cloud.', 'If the server dies, it runs from the cloud within minutes (green).'],
+   flow: ['Every few hours the server is copied to the backup box (blue).', 'The box sends a copy offsite to the cloud, out through the firewall.', 'If the server dies, it runs from the cloud within minutes (green).'],
    pitch: 'The question is not if a server fails, it’s how many hours you can be down. With BDR, minutes.',
    cam: { pos: V(20, 12, 4), target: V(10, 2, -7) },
    run() { every(600, () => packet(arc(V(10.6, 2, -7), V(8.6, 0.9, -7), 1.4), COL.safe, { speed: 4, size: 0.8 }));
-     every(2000, () => packet(arc(V(8.6, 0.9, -7), P.vault, 8), COL.safe, { speed: 14, onEnd: p => { flash('vault', COL.ok, 0.8); tag(top(p, 2.4), 'Offsite copy'); } }));
+     every(2200, () => outFrom({ pos: V(8.6, 0.9, -7) }, P.vault, 8, COL.safe, { speed: 14, onEnd: p => { flash('vault', COL.ok, 0.8); tag(top(p, 2.4), 'Offsite copy'); } }));
      every(5200, () => { flash('bdr', COL.ok, 0.8); tag(V(8.6, 2.2, -7), 'Snapshot taken'); }); } },
  { id: 'network', g: 'manage', name: 'eCare network management', short: 'Monitors and patches every device', objs: ['soc', 'server', 'switch', 'firewall', 'printer', 'ap0', 'ap1', 'ap2'],
    what: 'Every computer, server, switch, firewall and printer is monitored, patched and kept healthy.',
    gets: 'Security updates installed on schedule. Disk, memory and hardware problems flagged before they fail. A live inventory.',
    solves: 'Unpatched computers, surprise failures and “nobody noticed”.',
-   flow: ['Every device reports its health to us (blue).', 'We push updates and fixes back (blue).', 'Each device stays patched and healthy (green).'],
+   flow: ['Every device, in the office and at home, reports its health to us (blue).', 'We push updates and fixes back.', 'Each device stays patched and healthy (green).'],
    pitch: 'We look after every device the same way, every day, so problems are fixed before staff feel them.',
    cam: { pos: V(18, 18, 22), target: V(4, 1.5, 0) },
-   run() { every(350, () => { const d = pick(DEVICES.map(x => x.pos).concat([V(10.6, 3, -7), V(-11.6, 1.1, 0.5), V(-6.5, 0.9, 7.3)])); packet(arc(d, V(P.soc.x - 1, 4, P.soc.z), 6), COL.manage, { size: 0.55, speed: 18 }); });
-     every(1300, () => { const d = pick(DEVICES); packet(arc(V(P.soc.x - 1, 4, P.soc.z), d.pos, 7), COL.safe, { speed: 18, onEnd: () => hit(d, pick(['Patched', 'Healthy', 'Updated'])) }); }); } },
+   run() { every(380, () => { const infra = [{ pos: V(10.6, 3, -7) }, { pos: V(-6.5, 0.9, 7.3) }, ...APS.map(a => ({ pos: a.position }))];
+       outFrom(Math.random() < 0.7 ? pick(DEVICES) : pick(infra), SOCP(), 6, COL.manage, { size: 0.55, speed: 18 }); });
+     every(1400, () => { const d = pick(DEVICES); inTo(SOCP(), d, 7, COL.safe, { speed: 18, onEnd: () => hit(d, pick(['Patched', 'Healthy', 'Updated'])) }); }); } },
  { id: 'wifi', g: 'manage', name: 'Managed Wi-Fi and switching', short: 'Office Wi-Fi and network, looked after', objs: ['ap0', 'ap1', 'ap2', 'switch'],
    what: 'Office Wi-Fi access points and network switches, set up, monitored and updated.',
    gets: 'Full coverage, a separate guest network and switches watched for errors and failures.',
    solves: 'Dead zones, slow Wi-Fi and a failed switch taking the office offline.',
-   flow: ['Access points cover every corner of the office.', 'Every device gets a strong, secure connection (blue).', 'Switches and Wi-Fi are watched and updated (green).'],
+   flow: ['The switch in the server room feeds the Wi-Fi access points on the ceiling.', 'Every device gets a strong, secure connection (blue).', 'Switches and Wi-Fi are watched and updated (green).'],
    pitch: 'Wi-Fi is the network now. We make sure it covers the office and stays up.',
    cam: { pos: V(6, 16, 18), target: V(1, 2, 0) },
    run() { every(800, () => APS.forEach(a => ring(a.position.clone().setY(2.95), COL.manage, { r0: 0.4, r1: 5.5, dur: 1.6 })));
-     every(900, () => { const d = pick(office6()); packet(arc(pick(APS).position, d.pos, 0.6), COL.safe, { speed: 8, size: 0.7, onEnd: () => hit(d, null) }); }); } },
+     every(600, () => { const a = pick(APS); packet(arc(V(10.6, 3.35, -7), a.position, 0.8), COL.manage, { speed: 12, size: 0.6, onEnd: () => { const d = office6().reduce((b, x) => x.pos.distanceTo(a.position) < b.pos.distanceTo(a.position) ? x : b); packet(arc(a.position, d.pos, 0.6), COL.safe, { speed: 8, size: 0.7, onEnd: () => hit(d, null) }); } }); }); } },
  { id: 'mailbox', g: 'manage', name: 'Managed Mailbox', short: 'We run your Microsoft 365 admin', objs: ['m365', 'soc'],
    what: 'We run your Microsoft 365 admin: new users, departures, passwords, licenses and groups.',
    gets: 'New staff ready on day one, leavers blocked the same day, password resets on request, license overages flagged.',
    solves: 'Accounts left open after someone leaves, and paying for licenses nobody uses.',
-   flow: ['A request comes in: new hire, leaver, password, license.', 'Our team makes the change in Microsoft 365.', 'The person is ready to work, or locked out on time (green).'],
+   flow: ['A request comes in: new hire, leaver, password, license.', 'Our team makes the change in Microsoft 365.', 'The person is ready to work, in the office or at home, or locked out on time (green).'],
    pitch: 'Every mailbox has someone accountable for it: us.',
    cam: { pos: V(16, 18, 10), target: V(6, 9, -6) },
-   run() { every(2600, () => { const t = pick(['New user added', 'Password reset', 'License removed', 'Group updated']);
-     packet(arc(V(P.soc.x - 1, 4, P.soc.z), P.m365, 6), COL.cloud, { speed: 18, onEnd: p => { tag(top(p, 2.6), t, '#a58bff'); const d = pick(DEVICES); packet(arc(p, d.pos, 1), COL.safe, { speed: 14, onEnd: () => hit(d, 'Done') }); } }); }); } },
- { id: 'helpdesk', g: 'manage', name: 'eCare helpdesk', short: 'One number for every IT question', objs: ['soc'],
+   run() { every(2600, () => { const t = pick(['New user added', 'Password reset', 'License removed', 'Group updated']); const d = pick(DEVICES);
+     packet(arc(SOCP(), P.m365, 6), COL.cloud, { speed: 18, onEnd: p => { tag(top(p, 2.6), t, '#a58bff'); inTo(p, d, 3, COL.safe, { speed: 14, onEnd: () => hit(d, 'Done') }); } }); }); } },
+ { id: 'helpdesk', g: 'manage', name: 'eCare helpdesk', short: 'One number for every IT question', objs: ['soc', 'firewall'],
    what: 'Staff call, email or use the eCare app. A technician connects remotely and fixes it.',
    gets: 'One number for every IT question, with tickets tracked from start to finish.',
    solves: 'Staff stuck, or the office manager acting as IT.',
-   flow: ['Someone has a problem and sends a ticket (amber).', 'A technician connects remotely (blue).', 'Fixed, and the person is back to work (green).'],
+   flow: ['Someone has a problem, in the office or at home, and sends a ticket (amber).', 'A technician connects to that computer remotely (blue).', 'Fixed, and the person is back to work (green).'],
    pitch: 'Your team gets an IT department without hiring one.',
    cam: { pos: V(26, 16, 24), target: V(12, 2, 0) },
-   run() { every(2600, () => { const d = pick(DEVICES); flash(d.name, COL.protect, 1.4); tag(top(d.person.position, 2.3), 'Ticket sent', '#ffb547');
-     packet(arc(d.pos, V(P.soc.x - 1, 4, P.soc.z), 7), COL.protect, { speed: 18, onEnd: () => later(() => packet(arc(V(P.soc.x - 1, 4, P.soc.z), d.pos, 7), COL.safe, { speed: 18, onEnd: () => hit(d, 'Fixed remotely') }), 500) }); }); } },
- { id: 'm365', g: 'cloud', name: 'Microsoft 365 and Copilot', short: 'Email, Teams, files and AI', objs: ['m365', 'meeting', 'home'],
+   run() { every(2800, () => { const d = pick(DEVICES); flash(d.name, COL.protect, 1.6); tag(top(d.person.position, 2.3), 'Ticket sent', '#ffb547');
+     outFrom(d, SOCP(), 7, COL.protect, { speed: 18, onEnd: () => later(() => inTo(SOCP(), d, 7, COL.safe, { speed: 18, onEnd: () => hit(d, 'Fixed remotely') }), 500) }); }); } },
+ { id: 'm365', g: 'cloud', name: 'Microsoft 365 and Copilot', short: 'Email, Teams, files and AI', objs: ['m365', 'meeting', 'home', 'firewall'],
    what: 'Email, Teams, files and Copilot AI, licensed, set up and supported by us.',
    gets: 'The right licenses on one bill, Teams calls that work, files in OneDrive and SharePoint, Copilot rolled out with training.',
    solves: 'The wrong plans, wasted licenses and an AI rollout nobody uses.',
-   flow: ['Everyone saves files and works in Microsoft 365 (blue).', 'Teams connects the office and home workers.', 'Copilot helps write, summarize and find answers.'],
+   flow: ['Everyone, in the office and at home, saves files and works in Microsoft 365 (blue).', 'Teams connects the meeting room with the remote worker.', 'Copilot helps write, summarize and find answers.'],
    pitch: 'We license it, set it up and teach people to use it, including Copilot.',
    cam: { pos: V(14, 20, 24), target: V(0, 6, 0) },
-   run() { every(700, () => { const d = pick(DEVICES); packet(arc(d.pos, P.m365, 2), COL.safe, { speed: 13, size: 0.8 }); });
-     every(1600, () => packet(arc(V(-8.5, 2, -7.4), homeDesk.pos, 5), COL.cloud, { speed: 14, onEnd: () => hit(homeDesk, 'Teams call') }));
+   run() { every(700, () => outFrom(pick(DEVICES), P.m365, 3, COL.safe, { speed: 13, size: 0.8 }));
+     every(1800, () => outFrom({ pos: V(-8.5, 2, -7.4) }, P.m365, 3, COL.cloud, { speed: 14, onEnd: q => packet(arc(q, homeDesk.pos, 5), COL.cloud, { speed: 14, onEnd: () => hit(homeDesk, 'Teams call') }) }));
      every(3400, () => { flash('m365', COL.cloud, 0.8); tag(top(P.m365, 2.8), 'Copilot drafted the reply', '#a58bff'); }); } },
- { id: 'azure', g: 'cloud', name: 'Azure cloud', short: 'Your servers in Microsoft’s cloud', objs: ['azure', 'firewall'],
-   what: 'Servers and apps run in Microsoft’s cloud, linked to the office by a secure tunnel.',
+ { id: 'azure', g: 'cloud', name: 'Azure cloud', short: 'Your servers in Microsoft’s cloud', objs: ['azure', 'firewall', 'home', 'switch', 'ap0', 'ap1', 'ap2', 'remotelink'],
+   what: 'Servers and apps run in Microsoft’s cloud, linked to the office and to remote staff by secure VPN tunnels.',
    gets: 'No server closet to replace, capacity that grows with you, and the same monitoring as on-site servers.',
    solves: 'Aging servers and big hardware refresh bills.',
-   flow: ['The office connects to Azure through a secure tunnel (blue).', 'Apps and servers run in Microsoft’s data centers.', 'Staff work as if the server were in the office.'],
-   pitch: 'Move the server, keep the way people work.',
+   flow: ['Office staff go through Wi-Fi or cable, the switch and the office firewall, then an encrypted site-to-site VPN tunnel to Azure (blue).', 'Remote staff either use their own VPN straight to Azure (option A), or come in through the office remote access and ride the same site-to-site tunnel (option B).', 'Servers and apps run in Microsoft’s data centers. Answers come back the same way (violet).'],
+   pitch: 'Move the server, keep the way people work, in the office or at home.',
    cam: { pos: V(-2, 16, 6), target: V(-8, 7, -10) },
-   run() { every(420, () => { const up = Math.random() < 0.5; const a = V(-11.6, 1.2, 0.5), b = P.azure; packet(up ? arc(a, b, 3) : arc(b, a, 3), COL.safe, { speed: 12, size: 0.7 }); });
-     every(3600, () => { flash('azure', COL.ok, 0.8); tag(top(P.azure, 2.2), 'Secure tunnel up'); }); } },
- { id: 'esignit', g: 'cloud', name: 'eSignIt email signatures', short: 'Same branded signature on every email', objs: ['m365', 'internet'],
+   run() {
+     const office = tunnel(FWP, P.azure, 3, COL.safe, 'Site-to-site VPN');
+     const remote = tunnel(homeDesk.pos, P.azure, 6, COL.safe, 'Option A: own VPN straight to Azure');
+     TUNNELS.push(label('Option B: through the office', REMOTE_LINK.getPointAt(0.3).add(V(0, 1, 0)), 'small'));
+     every(650, () => { const d = pick(office6());
+       chain(d.pos, hopsToFirewall(d), COL.safe, { speed: 14, size: 0.7 }, () =>
+         packet(office, COL.safe, { speed: 12, size: 0.7, onEnd: () => { flash('azure', COL.ok, 0.3);
+           packet(arc(P.azure, FWP, 3), COL.cloud, { speed: 12, size: 0.6, onEnd: () => chain(FWP.clone(), hopsToFirewall(d).reverse().slice(1).concat([[d.pos.clone(), null]]), COL.cloud, { speed: 14, size: 0.6 }, () => hit(d, null)) }); } })); });
+     let viaOffice = false;
+     every(1700, () => {
+       viaOffice = !viaOffice;
+       if (!viaOffice) {   // option A: own VPN straight to Azure
+         packet(remote, COL.safe, { speed: 12, size: 0.7, onEnd: () => packet(arc(P.azure, homeDesk.pos, 6), COL.cloud, { speed: 12, size: 0.6, onEnd: () => hit(homeDesk, Math.random() < 0.4 ? 'Option A: direct VPN' : null) }) });
+       } else {            // option B: home -> office remote access -> firewall -> site-to-site tunnel -> Azure, and back
+         packet(REMOTE_LINK, COL.safe, { speed: 13, size: 0.7, onEnd: () => { flash('firewall', COL.safe, 0.3);
+           packet(office, COL.safe, { speed: 12, size: 0.7, onEnd: () => { flash('azure', COL.ok, 0.3);
+             packet(arc(P.azure, FWP, 3), COL.cloud, { speed: 12, size: 0.6, onEnd: () => { flash('firewall', COL.safe, 0.3);
+               packet(arc(FWP, homeDesk.pos, 5), COL.cloud, { speed: 13, size: 0.6, onEnd: () => hit(homeDesk, Math.random() < 0.4 ? 'Option B: via the office' : null) }); } }); } }); } });
+       }
+     });
+     every(4200, () => { flash('azure', COL.ok, 0.8); tag(top(P.azure, 2.2), 'Apps running in Azure'); });
+   } },
+ { id: 'esignit', g: 'cloud', name: 'eSignIt email signatures', short: 'Same branded signature on every email', objs: ['m365', 'internet', 'firewall'],
    what: 'Every email goes out with the same branded signature, managed in one place.',
    gets: 'Consistent signatures on every device, with banners for events or promotions.',
    solves: 'Mismatched, outdated or missing signatures.',
-   flow: ['Someone sends an email (grey).', 'eSignIt adds the company signature (violet).', 'Every email leaves looking the same.'],
+   flow: ['Someone sends an email, in the office or at home (grey).', 'eSignIt adds the company signature in the cloud (violet).', 'Every email leaves looking the same.'],
    pitch: 'Every email your team sends is a small ad. This makes them all match.',
    cam: { pos: V(-8, 20, 18), target: V(-12, 8, -4) },
-   run() { every(1100, () => { const d = pick(DEVICES); packet(arc(d.pos, P.m365, 2), COL.unchecked, { speed: 13, onEnd: p => { flash('m365', COL.cloud, 0.5); tag(top(p, 2.6), 'Signature added', '#a58bff'); packet(arc(p, P.internet, 6), COL.cloud, { speed: 15 }); } }); }); } },
+   run() { every(1100, () => outFrom(pick(DEVICES), P.m365, 3, COL.unchecked, { speed: 13, onEnd: p => { flash('m365', COL.cloud, 0.5); tag(top(p, 2.6), 'Signature added', '#a58bff'); packet(arc(p, P.internet, 6), COL.cloud, { speed: 15 }); } })); } },
  { id: 'print', g: 'manage', name: 'eCare Print', short: 'Printers paid per page, toner included', objs: ['printer', 'supplies'],
    what: 'Managed printers billed per page, with toner shipped automatically and service included.',
    gets: 'No toner runs, no surprise repair bills, a clear cost per page.',
@@ -599,7 +683,7 @@ const S = [
    pitch: 'Pay for pages, not printers.',
    cam: { pos: V(-14, 9, 22), target: V(-9, 2, 9) },
    run() { every(1000, () => { const d = pick(office6()); packet(arc(d.pos, V(-6.5, 0.9, 7.3), 1.5), COL.safe, { speed: 9, onEnd: p => { flash('printer', COL.ok, 0.4); tag(top(p, 1), '+1 page'); } }); });
-     every(4200, () => packet(arc(V(-6.5, 1, 7.3), P.supplies, 4), COL.manage, { speed: 10, onEnd: p => { tag(top(p, 1.6), 'Toner shipped'); } })); } }
+     every(4200, () => outFrom({ pos: V(-6.5, 1, 7.3) }, P.supplies, 4, COL.manage, { speed: 10, onEnd: p => { tag(top(p, 1.6), 'Toner shipped'); } })); } }
 ];
 const GROUPS = [['protect', 'Protect'], ['backup', 'Back up and recover'], ['manage', 'Manage and support'], ['cloud', 'Cloud and productivity']];
 const byId = Object.fromEntries(S.map(s => [s.id, s]));
@@ -610,22 +694,22 @@ const OFFICE_DEVS = () => DEVICES.filter(d => !d.remote).map(d => d.pos);
 const ALL_DEVS = () => DEVICES.map(d => d.pos);
 const SOCP = () => V(P.soc.x, 4, P.soc.z);
 const FRAME = {
-  firewall: () => [P.internet, at('firewall'), ...OFFICE_DEVS()],
-  email: () => [P.internet, P.mailfilter, P.m365, ...OFFICE_DEVS()],
+  firewall: () => [P.internet, at('firewall'), ...ALL_DEVS(), at('server'), at('switch')],
+  email: () => [P.internet, P.mailfilter, P.m365, ...ALL_DEVS(), at('firewall')],
   secureroute: () => [P.webfilter, P.internet, ...ALL_DEVS()],
-  soc: () => [...OFFICE_DEVS(), SOCP(), P.radar, P.m365, at('firewall'), at('server')],
-  sat: () => [P.mailfilter, ...ALL_DEVS()],
-  darkweb: () => [P.darkweb, SOCP(), ...OFFICE_DEVS()],
-  cloudbackup: () => [P.m365, P.vault],
-  bdr: () => [at('server'), at('bdr'), P.vault],
+  soc: () => [...ALL_DEVS(), SOCP(), P.radar, P.m365, at('firewall'), at('server')],
+  sat: () => [P.mailfilter, P.m365, ...ALL_DEVS()],
+  darkweb: () => [P.darkweb, SOCP(), P.m365, ...ALL_DEVS()],
+  cloudbackup: () => [P.m365, P.vault, ...ALL_DEVS(), at('firewall')],
+  bdr: () => [at('server'), at('bdr'), P.vault, at('firewall')],
   network: () => [...ALL_DEVS(), at('server'), at('firewall'), at('printer'), SOCP()],
-  wifi: () => [...APS.map(a => a.position), ...OFFICE_DEVS()],
-  mailbox: () => [SOCP(), P.m365, ...OFFICE_DEVS()],
-  helpdesk: () => [...ALL_DEVS(), SOCP()],
+  wifi: () => [...APS.map(a => a.position), ...OFFICE_DEVS(), at('switch')],
+  mailbox: () => [SOCP(), P.m365, ...ALL_DEVS(), at('firewall')],
+  helpdesk: () => [...ALL_DEVS(), SOCP(), at('firewall')],
   m365: () => [...ALL_DEVS(), P.m365, at('meeting')],
-  azure: () => [at('firewall'), P.azure],
-  esignit: () => [...OFFICE_DEVS(), P.m365, P.internet],
-  print: () => [...OFFICE_DEVS(), at('printer'), P.supplies]
+  azure: () => [at('firewall'), P.azure, ...ALL_DEVS(), at('switch')],
+  esignit: () => [...ALL_DEVS(), P.m365, P.internet, at('firewall')],
+  print: () => [...OFFICE_DEVS(), at('printer'), P.supplies, at('firewall')]
 };
 S.forEach(s => Object.defineProperty(s, 'cam', { configurable: true, get: () => fitView(FRAME[s.id]()) }));
 
@@ -849,7 +933,7 @@ document.querySelectorAll('.modes button').forEach(b => b.addEventListener('clic
 
 // click a device or node in 3D to open the matching service
 const ray = new THREE.Raycaster(), mouse = new THREE.Vector2();
-const OBJ_TO_SERVICE = { firewall: 'firewall', mailfilter: 'email', webfilter: 'secureroute', soc: 'soc', radar: 'soc', darkweb: 'darkweb', vault: 'cloudbackup', bdr: 'bdr', server: 'bdr', switch: 'wifi', ap0: 'wifi', ap1: 'wifi', ap2: 'wifi', m365: 'm365', meeting: 'm365', azure: 'azure', printer: 'print', supplies: 'print', home: 'secureroute' };
+const OBJ_TO_SERVICE = { firewall: 'firewall', mailfilter: 'email', webfilter: 'secureroute', soc: 'soc', radar: 'soc', darkweb: 'darkweb', vault: 'cloudbackup', bdr: 'bdr', server: 'bdr', switch: 'wifi', ap0: 'wifi', ap1: 'wifi', ap2: 'wifi', m365: 'm365', meeting: 'm365', azure: 'azure', printer: 'print', supplies: 'print', home: 'secureroute', remotelink: 'firewall' };
 DEVICES.forEach(d => OBJ_TO_SERVICE[d.name] = 'network');
 let downAt = null;
 renderer.domElement.addEventListener('pointerdown', e => downAt = [e.clientX, e.clientY]);
@@ -859,6 +943,9 @@ renderer.domElement.addEventListener('pointerup', e => {
   const hits = ray.intersectObjects(ALL, true);
   for (const h of hits) { let o = h.object; while (o && !o.userData.name) o = o.parent; const sid = o && OBJ_TO_SERVICE[o.userData.name]; if (sid) { if (mode !== 'explore') setMode('explore'); selectService(sid); break; } }
 });
+
+// gentle background life: the remote worker stays connected to the office while nothing is selected
+setInterval(() => { if (mode === 'explore' && !current && !document.hidden) remoteSession(); }, 2400);
 
 // ---------------------------------------------------------------- intro and loop
 renderServicesRail();
